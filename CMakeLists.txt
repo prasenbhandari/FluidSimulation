@@ -14,7 +14,7 @@ include_directories(include)
 set(SOURCES
     src/main.cpp
     src/simulation.cpp
-    src/particle.cpp
+    src/spatial_hash.cpp
 )
 
 # --- Build Target ---

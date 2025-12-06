@@ -19,12 +19,12 @@ int main(){
         if (delta_time > 0.05f) delta_time = 0.05f;
 
         sim.update(delta_time);
-        sim.handle_input();
 
         BeginDrawing();
         ClearBackground(BLACK);
-
+        DrawFPS(10, 10);
         sim.draw();
+        sim.draw_gui();  // Draw raygui controls
 
         EndDrawing();
     }
