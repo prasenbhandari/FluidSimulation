@@ -1,7 +1,10 @@
 #include "simulation.h"
 
+#include <rlgl.h>
+
 #include <algorithm>
-#include <cmath>
+
+#include "raymath.h"
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
@@ -9,23 +12,40 @@
 const int WINDOW_WIDTH = 800 / PIXELS_PER_METER;
 const int WINDOW_HEIGHT = 600 / PIXELS_PER_METER;
 
-FluidSimulation::FluidSimulation() : spatial_hash(params.smoothing_radius, params.num_particles) {
+FluidSimulation::FluidSimulation() {
     init();
+    reset();
     update_kernel_constants();
 }
 
 FluidSimulation::~FluidSimulation() {}
 
-void FluidSimulation::init() { reset(); }
+void FluidSimulation::init() {
+    ssbo_id = rlLoadShaderBuffer(sizeof(Particle) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
+    rlBindShaderBuffer(ssbo_id, 0);
+
+    ssbo_indices = rlLoadShaderBuffer(sizeof(ParticleIndex) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
+
+    ssbo_offsets = rlLoadShaderBuffer(sizeof(unsigned int) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
+
+    particle_shader = LoadShader("../res/shaders/particle.vs", "../res/shaders/particle.fs");
+    particle_shader.locs[SHADER_LOC_MATRIX_MVP] = GetShaderLocation(particle_shader, "mvp");
+
+    hash_shader.load("../res/shaders/calculate_hash.comp");
+
+    quad_mesh = GenMeshPlane(1.0f, 1.0f, 1, 1);
+    quad_material = LoadMaterialDefault();
+    quad_material.shader = particle_shader;
+
+    integrate_shader.load("../res/shaders/integrate.comp");
+    offset_shader.load("../res/shaders/calculate_offset.comp");
+    density_shader.load("../res/shaders/calculate_density.comp");
+    force_shader.load("../res/shaders/calculate_forces.comp");
+}
 
 void FluidSimulation::reset() {
-    position.clear();
-    predicted_position.clear();
-    velocity.clear();
-    force.clear();
-    density.clear();
-    near_density.clear();
-    pressure.clear();
+    std::vector<Particle> particles(params.num_particles);
+    dummy_transforms.resize(params.num_particles);
 
     int particle_per_row = (int)sqrt(params.num_particles);
     float spacing = params.smoothing_radius * 0.9f;
@@ -34,257 +54,186 @@ void FluidSimulation::reset() {
     float startY = WINDOW_HEIGHT / 4.0f;
 
     for (int i = 0; i < params.num_particles; i++) {
+        dummy_transforms[i] = MatrixIdentity();
+
         float x = startX + (i % particle_per_row) * spacing;
         float y = startY + (i / particle_per_row) * spacing;
 
         x += (float)GetRandomValue(-10, 10) / 100.0f;
 
-        x += (float)GetRandomValue(-10, 10) / 100.0f;
+        y += (float)GetRandomValue(-10, 10) / 100.0f;
 
-        position.push_back({x, y});
-        predicted_position.push_back({x, y});
-        velocity.push_back({0, 0});
-        force.push_back({0, 0});
-        density.push_back(0);
-        near_density.push_back(0);
-        pressure.push_back(0);
+        particles[i].position = {x, y};
+        particles[i].predicted_position = {x, y};
+        particles[i].velocity = {0, 0};
+        particles[i].force = {0, 0};
+        particles[i].density = 0;
+        particles[i].near_density = 0;
+        particles[i].pressure = 0;
     }
 
-    spatial_hash = SpatialHash(params.smoothing_radius, params.num_particles);
+    rlUpdateShaderBuffer(ssbo_id, particles.data(), sizeof(Particle) * params.num_particles, 0);
     update_kernel_constants();
 }
 
 void FluidSimulation::update(float delta_time) {
-    if (delta_time > 0.03f) delta_time = 0.03f;
+    update_integration(delta_time);
+    update_spatial_hash();
+    update_density();
+    update_forces();
+}
 
-    int substeps = 4;
-    float subtime = delta_time / (float)substeps;
+void FluidSimulation::update_integration(float delta_time) {
+    unsigned int program = integrate_shader.get_program_id();
+    rlEnableShader(program);
 
-    for (int i = 0; i < substeps; i++) {
-        for (size_t k = 0; k < position.size(); k++) {
-            // Prediction: Predict where particles will be based on current velocity
-            predicted_position[k].x = position[k].x + velocity[k].x * subtime;
-            predicted_position[k].y = position[k].y + velocity[k].y * subtime;
-        }
+    int dt_loc = rlGetLocationUniform(program, "deltaTime");
+    int grav_loc = rlGetLocationUniform(program, "gravity");
+    int damp_loc = rlGetLocationUniform(program, "damping");
+    int windowSize_loc = rlGetLocationUniform(program, "windowSize");
 
-        spatial_hash.update(predicted_position);
+    rlSetUniform(dt_loc, &delta_time, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(grav_loc, &params.gravity, SHADER_UNIFORM_FLOAT, 1);
 
-        compute_density_pressure();
-        compute_forces();
-        apply_mouse_force();
-        integrate(subtime);
-    }
+    float damping_val = fabs(params.boundary_damping);
+    rlSetUniform(damp_loc, &damping_val, SHADER_UNIFORM_FLOAT, 1);
+
+    float size[2] = {(float)WINDOW_WIDTH, (float)WINDOW_HEIGHT};
+    rlSetUniform(windowSize_loc, size, SHADER_UNIFORM_VEC2, 1);
+
+    rlBindShaderBuffer(ssbo_id, 0);
+
+    int num_groups = (params.num_particles + 63) / 64;
+    integrate_shader.dispatch(num_groups, 1, 1);
+
+    rlDisableShader();
+}
+
+void FluidSimulation::update_spatial_hash() {
+    int num_groups = (params.num_particles + 63) / 64;
+
+    unsigned int hash_program = hash_shader.get_program_id();
+    rlEnableShader(hash_program);
+    int space_loc = rlGetLocationUniform(hash_program, "spacing");
+    int num_loc = rlGetLocationUniform(hash_program, "num_particles");
+
+    unsigned int num_particles_uint = (unsigned int)params.num_particles;
+    rlSetUniform(space_loc, &params.smoothing_radius, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(num_loc, &num_particles_uint, SHADER_UNIFORM_UINT, 1);
+
+    rlBindShaderBuffer(ssbo_id, 0);
+    rlBindShaderBuffer(ssbo_indices, 1);
+
+    hash_shader.dispatch(num_groups, 1, 1);
+
+    std::vector<ParticleIndex> cpu_indices(params.num_particles);
+    rlReadShaderBuffer(ssbo_indices, cpu_indices.data(), cpu_indices.size() * sizeof(ParticleIndex), 0);
+
+    std::sort(cpu_indices.begin(), cpu_indices.end(),
+              [](const ParticleIndex& a, const ParticleIndex& b) { return a.cell_key < b.cell_key; });
+
+    rlUpdateShaderBuffer(ssbo_indices, cpu_indices.data(), cpu_indices.size() * sizeof(ParticleIndex), 0);
+
+    std::vector<unsigned int> clear_offsets(params.num_particles, -1);
+    rlUpdateShaderBuffer(ssbo_offsets, clear_offsets.data(), clear_offsets.size() * sizeof(unsigned int), 0);
+
+    unsigned int offset_program = offset_shader.get_program_id();
+    rlEnableShader(offset_program);
+
+    int num_loc_off = rlGetLocationUniform(offset_program, "num_particles");
+    rlSetUniform(num_loc_off, &num_particles_uint, SHADER_UNIFORM_UINT, 1);
+
+    rlBindShaderBuffer(ssbo_indices, 0);
+    rlBindShaderBuffer(ssbo_offsets, 1);
+
+    offset_shader.dispatch(num_groups, 1, 1);
+
+    rlDisableShader();
+}
+
+void FluidSimulation::update_density() {
+    int num_groups = (params.num_particles + 63) / 64;
+
+    unsigned int density_program = density_shader.get_program_id();
+    rlEnableShader(density_program);
+
+    int num_loc = rlGetLocationUniform(density_program, "num_particles");
+    int poly6_loc = rlGetLocationUniform(density_program, "poly6_scale");
+    int spiky_loc = rlGetLocationUniform(density_program, "spiky_pow3_scale");
+    int smooth_loc = rlGetLocationUniform(density_program, "smoothing_radius_sq");
+    int spacing_loc = rlGetLocationUniform(density_program, "spacing");
+
+    unsigned int num_particles_uint = (unsigned int)params.num_particles;
+    rlSetUniform(num_loc, &num_particles_uint, SHADER_UNIFORM_UINT, 1);
+    rlSetUniform(poly6_loc, &kernel_constants.poly6_scale, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(spiky_loc, &kernel_constants.spiky_pow3_scale, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(smooth_loc, &kernel_constants.smoothing_radius_sq, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(spacing_loc, &params.smoothing_radius, SHADER_UNIFORM_FLOAT, 1);
+
+    rlBindShaderBuffer(ssbo_id, 0);
+    rlBindShaderBuffer(ssbo_indices, 1);
+    rlBindShaderBuffer(ssbo_offsets, 2);
+
+    density_shader.dispatch(num_groups, 1, 1);
+
+    rlDisableShader();
+}
+
+void FluidSimulation::update_forces() {
+    int num_groups = (params.num_particles + 63) / 64;
+
+    unsigned int force_program = force_shader.get_program_id();
+    rlEnableShader(force_program);
+
+    int num_loc = rlGetLocationUniform(force_program, "num_particles");
+    int spacing_loc = rlGetLocationUniform(force_program, "spacing");
+    int smooth_loc = rlGetLocationUniform(force_program, "smoothing_radius");
+    int interact_loc = rlGetLocationUniform(force_program, "interaction_strength");
+    int near_pres_loc = rlGetLocationUniform(force_program, "near_pressure_multiplier");
+    int visc_str_loc = rlGetLocationUniform(force_program, "viscosity_strength");
+
+    int spiky_grad_loc = rlGetLocationUniform(force_program, "spiky_pow2_grad_scale");
+    int near_grad_loc = rlGetLocationUniform(force_program, "spiky_pow3_grad_scale");
+    int visc_loc = rlGetLocationUniform(force_program, "viscosity_scale");
+    int rest_density_loc = rlGetLocationUniform(force_program, "rest_density");
+
+    unsigned int num_particles_uint = (unsigned int)params.num_particles;
+    rlSetUniform(num_loc, &num_particles_uint, SHADER_UNIFORM_UINT, 1);
+    rlSetUniform(spacing_loc, &params.smoothing_radius, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(smooth_loc, &params.smoothing_radius, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(interact_loc, &params.interaction_strength, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(near_pres_loc, &params.near_pressure_multiplier, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(visc_str_loc, &params.viscosity_strength, SHADER_UNIFORM_FLOAT, 1);
+
+    rlSetUniform(spiky_grad_loc, &kernel_constants.spiky_pow2_grad_scale, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(near_grad_loc, &kernel_constants.spiky_pow3_grad_scale, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(visc_loc, &kernel_constants.viscosity_scale, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(rest_density_loc, &params.rest_density, SHADER_UNIFORM_FLOAT, 1);
+
+    rlBindShaderBuffer(ssbo_id, 0);       // Particles (RW)
+    rlBindShaderBuffer(ssbo_indices, 1);  // Indices (Read)
+    rlBindShaderBuffer(ssbo_offsets, 2);  // Offsets (Read)
+
+    force_shader.dispatch(num_groups, 1, 1);
+
+    rlDisableShader();
 }
 
 void FluidSimulation::draw() {
-    for (size_t i = 0; i < position.size(); i++) {
-        Vector2 screen_pos = {position[i].x * PIXELS_PER_METER, position[i].y * PIXELS_PER_METER};
+    BeginShaderMode(particle_shader);
+    rlEnableShader(particle_shader.id);
 
-        float speed = sqrt(velocity[i].x * velocity[i].x + velocity[i].y * velocity[i].y);
-        float t = speed / 8.0f;
+    Matrix mvp = MatrixMultiply(rlGetMatrixModelview(), rlGetMatrixProjection());
+    SetShaderValueMatrix(particle_shader, particle_shader.locs[SHADER_LOC_MATRIX_MVP], mvp);
 
-        if (t > 1.0f) t = 1.0f;
+    rlBindShaderBuffer(ssbo_id, 0);
 
-        Color p_color = {(unsigned char)(0 + t * 150), (unsigned char)(50 + t * 205), (unsigned char)(150 + t * 105),
-                         255};
+    rlEnableVertexArray(quad_mesh.vaoId);
 
-        DrawCircleV(screen_pos, 4.0f, p_color);
-    }
-}
+    rlDrawVertexArrayElementsInstanced(0, quad_mesh.triangleCount * 3, 0, params.num_particles);
 
-void FluidSimulation::apply_mouse_force() {
-    if (IsMouseButtonDown(MOUSE_LEFT_BUTTON) || IsMouseButtonDown(MOUSE_RIGHT_BUTTON)) {
-        Vector2 mousePos = GetMousePosition();
-
-        if (mousePos.x > 800 - 220) return;
-
-        float world_x = mousePos.x / PIXELS_PER_METER;
-        float world_y = mousePos.y / PIXELS_PER_METER;
-
-        // Left Click = Repel (+), Right Click = Attract (-)
-        float strength =
-            (IsMouseButtonDown(MOUSE_LEFT_BUTTON) ? params.interaction_strength : -params.interaction_strength);
-
-        for (size_t i = 0; i < position.size(); i++) {
-            float dx = world_x - position[i].x;
-            float dy = world_y - position[i].y;
-            float distSq = dx * dx + dy * dy;
-
-            if (distSq < params.interaction_radius * params.interaction_radius) {
-                float dist = sqrt(distSq);
-                if (dist < 0.001f) dist = 0.001f;
-
-                float dirX = dx / dist;
-                float dirY = dy / dist;
-
-                float factor = 1.0f - (dist / params.interaction_radius);
-
-                // F = Strength * Factor
-                // Acceleration = F / Density (approx mass/density)
-                float force_val = strength * factor;
-
-                force[i].x -= dirX * force_val * density[i];
-                force[i].y -= dirY * force_val * density[i];
-            }
-        }
-    }
-}
-
-void FluidSimulation::compute_density_pressure() {
-    for (size_t i = 0; i < position.size(); i++) {
-        density[i] = 0.0f;
-        near_density[i] = 0.0f;
-
-        spatial_hash.for_each_neighbor(predicted_position[i], [&](int j) {
-            float dx = predicted_position[j].x - predicted_position[i].x;
-            float dy = predicted_position[j].y - predicted_position[i].y;
-
-            float distance_squared = dx * dx + dy * dy;
-
-            if (distance_squared < kernel_constants.smoothing_radius_sq) {
-                float distance = sqrt(distance_squared);
-                density[i] += params.mass * poly6_kernel(distance_squared);
-                near_density[i] += params.mass * spiky_pow3_kernel(distance);
-            }
-        });
-
-        if (density[i] < 0.0001f) density[i] = 0.0001f;
-
-        pressure[i] = params.stiffness * (density[i] - params.rest_density);
-
-        if (pressure[i] < 0.0f) pressure[i] = 0.0f;
-    }
-}
-
-void FluidSimulation::compute_forces() {
-    for (size_t i = 0; i < position.size(); i++) {
-        Vector2 pressure_force = {0.0f, 0.0f};
-        Vector2 viscosity_force = {0.0f, 0.0f};
-
-        spatial_hash.for_each_neighbor(predicted_position[i], [&](int j) {
-            if (i == (size_t)j) return;
-
-            float dx = predicted_position[j].x - predicted_position[i].x;
-            float dy = predicted_position[j].y - predicted_position[i].y;
-            float distance_squared = dx * dx + dy * dy;
-
-            if (distance_squared > 0 && distance_squared < kernel_constants.smoothing_radius_sq) {
-                float distance = sqrt(distance_squared);
-                float direction_x = dx / distance;
-                float direction_y = dy / distance;
-
-                // --- Pressure Forces (Double Density Relaxation) ---
-                float shared_pressure = (pressure[i] + pressure[j]) / 2.0f;
-                float shared_near_pressure = (near_density[i] * params.near_pressure_multiplier +
-                                              near_density[j] * params.near_pressure_multiplier) /
-                                             2.0f;
-
-                // Regular Pressure: Uses Linear Gradient (spiky_pow2_gradient)
-                float slope = spiky_pow2_gradient(distance);  // Linear
-                // Near Pressure: Uses Quadratic Gradient (spiky_pow3_gradient)
-                float near_slope = spiky_pow3_gradient(distance);  // Quadratic
-
-                // F = -m * [ (P+P)/2 * Grad + (P_near+P_near)/2 * Grad_Near ] / rho
-                float p_term = shared_pressure * slope;
-                float near_p_term = shared_near_pressure * near_slope;
-
-                float term = params.mass * (p_term + near_p_term) / density[j];
-
-                pressure_force.x += term * direction_x;
-                pressure_force.y += term * direction_y;
-
-                // --- Viscosity Force ---
-                // Fv = mu * m * (vj - vi) / rho_j * Laplacian(W)
-                float visc_laplacian = viscosity_kernel(distance);
-                float vx_diff = velocity[j].x - velocity[i].x;
-                float vy_diff = velocity[j].y - velocity[i].y;
-
-                float visc_term = params.viscosity_strength * params.mass * visc_laplacian / density[j];
-                viscosity_force.x += vx_diff * visc_term;
-                viscosity_force.y += vy_diff * visc_term;
-            }
-        });
-
-        force[i].x = pressure_force.x + viscosity_force.x;
-        force[i].y = pressure_force.y + viscosity_force.y;
-    }
-}
-
-void FluidSimulation::integrate(float delta_time) {
-    for (size_t i = 0; i < position.size(); i++) {
-        // Apply gravity if enabled
-        if (params.gravity_enabled) {
-            force[i].y += params.gravity * density[i];
-        }
-
-        Vector2 acceleration = {force[i].x / density[i], force[i].y / density[i]};
-
-        velocity[i].x += acceleration.x * delta_time;
-        velocity[i].y += acceleration.y * delta_time;
-
-        position[i].x += velocity[i].x * delta_time;
-        position[i].y += velocity[i].y * delta_time;
-
-        float boundary_margin = 0.1f;
-
-        if (position[i].x > WINDOW_WIDTH - boundary_margin) {
-            position[i].x = WINDOW_WIDTH - boundary_margin;
-            velocity[i].x *= params.boundary_damping;
-        }
-        if (position[i].x < boundary_margin) {
-            position[i].x = boundary_margin;
-            velocity[i].x *= params.boundary_damping;
-        }
-        if (position[i].y > WINDOW_HEIGHT - boundary_margin) {
-            position[i].y = WINDOW_HEIGHT - boundary_margin;
-            velocity[i].y *= params.boundary_damping;
-        }
-        if (position[i].y < boundary_margin) {
-            position[i].y = boundary_margin;
-            velocity[i].y *= params.boundary_damping;
-        }
-    }
-}
-
-float FluidSimulation::poly6_kernel(float distance_squared) {
-    if (distance_squared >= kernel_constants.smoothing_radius_sq) {
-        return 0.0f;
-    }
-    float diff = kernel_constants.smoothing_radius_sq - distance_squared;
-
-    return kernel_constants.poly6_scale * diff * diff * diff;
-}
-
-float FluidSimulation::spiky_pow2_gradient(float distance) {
-    if (distance >= params.smoothing_radius || distance <= 0.0f) {
-        return 0.0f;
-    }
-    float diff = params.smoothing_radius - distance;
-
-    return -12.0f / (PI * pow(params.smoothing_radius, 4)) * diff;
-}
-
-float FluidSimulation::spiky_pow3_kernel(float distance) {
-    if (distance >= params.smoothing_radius) return 0.0f;
-    float diff = params.smoothing_radius - distance;
-
-    return kernel_constants.spiky_pow3_scale * diff * diff * diff;
-}
-
-float FluidSimulation::spiky_pow3_gradient(float distance) {
-    if (distance >= params.smoothing_radius || distance <= 0.0f) return 0.0f;
-    float diff = params.smoothing_radius - distance;
-
-    return kernel_constants.spiky_pow3_grad_scale * diff * diff;
-}
-
-float FluidSimulation::viscosity_kernel(float distance) {
-    if (distance >= params.smoothing_radius || distance < 0.0f) {
-        return 0.0f;
-    }
-    float diff = params.smoothing_radius - distance;
-
-    return kernel_constants.viscosity_scale * diff;
+    rlDisableVertexArray();
+    EndShaderMode();
 }
 
 void FluidSimulation::update_kernel_constants() {
@@ -303,11 +252,11 @@ void FluidSimulation::update_kernel_constants() {
     // Spiky Pow3 (Near Density): 10 / (PI * h^5)
     kernel_constants.spiky_pow3_scale = 10.0f / (PI * h5);
 
-    // Spiky Pow2 Gradient (Pressure): -12 / (PI * h^4)
-    kernel_constants.spiky_pow2_grad_scale = -12.0f / (PI * h4);
+    // Spiky Pow2 Gradient (Pressure): 12 / (PI * h^4)
+    kernel_constants.spiky_pow2_grad_scale = 12.0f / (PI * h4);
 
-    // Spiky Pow3 Gradient (Near Pressure): -30 / (PI * h^5)
-    kernel_constants.spiky_pow3_grad_scale = -30.0f / (PI * h5);
+    // Spiky Pow3 Gradient (Near Pressure): 30 / (PI * h^5)
+    kernel_constants.spiky_pow3_grad_scale = 30.0f / (PI * h5);
 
     // Viscosity: 40 / (PI * h^5)
     kernel_constants.viscosity_scale = 40.0f / (PI * h5);
@@ -380,9 +329,6 @@ void FluidSimulation::draw_gui() {
     // Update spatial hash and constants if radius changed appropriately
     if (fabs(params.smoothing_radius - old_radius) > 0.001f) {
         update_kernel_constants();
-        if (fabs(params.smoothing_radius - old_radius) > 0.01f) {
-            spatial_hash = SpatialHash(params.smoothing_radius, params.num_particles);
-        }
     }
     y += spacing;
 
@@ -426,7 +372,7 @@ void FluidSimulation::draw_gui() {
 
     // Info
     GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20},
-             TextFormat("Particles: %d", (int)position.size()));
+             TextFormat("Particles: %d", params.num_particles));
     y += 20;
     GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20}, "LMB: Push  RMB: Pull");
 }

@@ -1,0 +1,75 @@
+#version 430
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+uniform float deltaTime;
+uniform float gravity;
+uniform float damping;
+uniform vec2 windowSize;
+
+struct Particle {
+    vec2 position;
+    vec2 predicted_position;
+    vec2 velocity;
+    vec2 force;
+    float density;
+    float near_density;
+    float pressure;
+    float padding; // Alignment
+};
+
+layout(std430, binding = 0) buffer ParticleBuffer {
+    Particle particles[];
+};
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+
+    if (id >= particles.length()) return;
+
+    Particle p = particles[id];
+
+    vec2 force_contribution = p.force * deltaTime;
+    
+    float force_mag = length(force_contribution);
+    const float MAX_FORCE_CONTRIBUTION = 5.0;
+    if (force_mag > MAX_FORCE_CONTRIBUTION) {
+        force_contribution = normalize(force_contribution) * MAX_FORCE_CONTRIBUTION;
+    }
+    
+    p.velocity += force_contribution;
+    p.velocity.y += gravity * deltaTime;
+    p.force = vec2(0.0);
+    
+    p.velocity *= 0.99;
+    
+    float vel_mag = length(p.velocity);
+    const float MAX_VELOCITY = 20.0;
+    if (vel_mag > MAX_VELOCITY) {
+        p.velocity = normalize(p.velocity) * MAX_VELOCITY;
+    }
+
+    p.position += p.velocity * deltaTime;
+    p.predicted_position = p.position + p.velocity * deltaTime;
+
+    float radius = 0.15;
+    
+    if (p.position.x < 0 + radius) {
+        p.position.x = 0 + radius;
+        p.velocity.x = -p.velocity.x * damping;
+    }
+    if (p.position.x > windowSize.x - radius) {
+        p.position.x = windowSize.x - radius;
+        p.velocity.x = -p.velocity.x * damping;
+    }
+    if (p.position.y < 0 + radius) {
+        p.position.y = 0 + radius;
+        p.velocity.y = -p.velocity.y * damping;
+    }
+    if (p.position.y > windowSize.y - radius) {
+        p.position.y = windowSize.y - radius;
+        p.velocity.y = -p.velocity.y * damping;
+    }
+    
+    particles[id] = p;
+}

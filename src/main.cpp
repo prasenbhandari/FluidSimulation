@@ -1,30 +1,38 @@
-#include "simulation.h"
+
+#include <iostream>
+
+#include "compute_shader.h"
 #include "raylib.h"
+#include "rlgl.h"
+#include "simulation.h"
 
 const int WINDOW_WIDTH = 800;
 const int WINDOW_HEIGHT = 600;
 
-
-int main(){
+int main() {
+    SetConfigFlags(FLAG_VSYNC_HINT);
     InitWindow(WINDOW_WIDTH, WINDOW_HEIGHT, "Fluid Simulation");
-
-    FluidSimulation sim;
-    sim.init();
-
     SetTargetFPS(60);
 
-    while (!WindowShouldClose()){
-        float delta_time = GetFrameTime();
+    FluidSimulation sim;
 
-        if (delta_time > 0.05f) delta_time = 0.05f;
+    Camera2D camera = {0};
+    camera.zoom = PIXELS_PER_METER;
 
-        sim.update(delta_time);
+    const float FIXED_DT = 1.0f / 60.0f;
+
+    while (!WindowShouldClose()) {
+        sim.update(FIXED_DT);
 
         BeginDrawing();
         ClearBackground(BLACK);
-        DrawFPS(10, 10);
+
+        BeginMode2D(camera);
         sim.draw();
-        sim.draw_gui();  // Draw raygui controls
+        EndMode2D();
+
+        DrawFPS(10, 10);
+        sim.draw_gui();
 
         EndDrawing();
     }

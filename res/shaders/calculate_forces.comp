@@ -1,0 +1,124 @@
+#version 430
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec2 position;
+    vec2 predicted_position;
+    vec2 velocity;
+    vec2 force;
+    float density;
+    float near_density;
+    float pressure;
+    float padding;
+};
+
+struct ParticleIndex {
+    uint cell_key;
+    uint particle_id;
+};
+
+layout(std430, binding = 0) buffer ParticleBuffer {
+    Particle particles[];
+};
+
+layout(std430, binding = 1) buffer IndicesBuffer {
+    ParticleIndex indices[];
+};
+
+layout(std430, binding = 2) buffer OffsetsBuffer {
+    uint offsets[];
+};
+
+uniform uint num_particles;
+uniform float spacing;
+uniform float smoothing_radius;
+uniform float interaction_strength;
+uniform float near_pressure_multiplier;
+uniform float viscosity_strength;
+
+uniform float spiky_pow2_grad_scale;
+uniform float spiky_pow3_grad_scale;
+uniform float viscosity_scale;
+uniform float rest_density;
+
+uint hash(int x, int y) {
+    uint h = (uint(x) * 15823u) ^ (uint(y) * 9737333u);
+    return h % num_particles;
+}
+
+float spiky_gradient(float dist, float h_minus_r) {
+    return spiky_pow2_grad_scale * h_minus_r * h_minus_r;
+}
+
+float near_gradient(float dist, float h_minus_r) {
+    return spiky_pow3_grad_scale * h_minus_r * h_minus_r * h_minus_r;
+}
+
+float viscosity_kernel(float dist, float h_minus_r) {
+    return viscosity_scale * h_minus_r * h_minus_r;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= num_particles) return;
+
+    Particle p = particles[id];
+    
+    vec2 force = vec2(0.0);
+    
+    float density = p.density;
+    float near_density = p.near_density;
+    float pressure = interaction_strength * (density - rest_density);
+    float near_pressure = near_pressure_multiplier * near_density;
+    
+    ivec2 grid_pos = ivec2(p.predicted_position / spacing);
+
+    for(int x = -1; x <= 1; x++){
+        for(int y = -1; y <= 1; y++){
+            ivec2 neighbor_pos = grid_pos + ivec2(x, y);
+            uint cell_key = hash(neighbor_pos.x, neighbor_pos.y);
+            uint start_index = offsets[cell_key];
+            
+            if (start_index == 0xFFFFFFFF) continue;
+
+            for(uint i = start_index; i < num_particles; i++){
+                if(indices[i].cell_key != cell_key) break;
+                
+                uint neighbor_id = indices[i].particle_id;
+                if (neighbor_id == id) continue; // Skip self
+
+                Particle n = particles[neighbor_id];
+                
+                vec2 r = n.predicted_position - p.predicted_position;
+                float r2 = dot(r, r);
+                
+                if (r2 < smoothing_radius * smoothing_radius && r2 > 0.00001) {
+                    float dist = sqrt(r2);
+                    float h_minus_r = smoothing_radius - dist;
+                    vec2 dir = r / dist;
+
+                    
+                    float n_pressure = interaction_strength * (n.density - rest_density);
+                    float n_near_pressure = near_pressure_multiplier * n.near_density;
+
+                    float shared_pressure = (pressure + n_pressure) / 2.0;          
+                    float shared_near_pressure = (near_pressure + n_near_pressure) / 2.0;
+                    
+                    float p_term = spiky_gradient(dist, h_minus_r) * shared_pressure;
+                    float near_term = near_gradient(dist, h_minus_r) * shared_near_pressure;
+                    
+                    force -= dir * (p_term + near_term) / n.density;
+
+                    vec2 vel_diff = n.velocity - p.velocity;
+                    float visc_term = viscosity_kernel(dist, h_minus_r) * viscosity_strength;
+                    
+                    force += vel_diff * visc_term / n.density;
+                }
+            }
+        }
+    }
+
+    particles[id].force = force;
+    particles[id].pressure = pressure;
+}

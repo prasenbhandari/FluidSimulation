@@ -2,8 +2,8 @@
 
 #include <vector>
 
+#include "compute_shader.h"
 #include "raylib.h"
-#include "spatial_hash.h"
 
 const float PIXELS_PER_METER = 50.0f;
 
@@ -22,17 +22,33 @@ struct KernelConstants {
 struct SimParams {
     float gravity = 10.0f;
     float mass = 1.0f;
-    float rest_density = 10.0f;
+    float rest_density = 5.0f;
     float stiffness = 50.0f;
-    float near_pressure_multiplier = 2.0f;
-    float smoothing_radius = 0.6f;
+    float near_pressure_multiplier = 1.0f;
+    float smoothing_radius = 0.5f;
     float damping = 0.97f;
-    float boundary_damping = -0.5f;
+    float boundary_damping = 0.95f;
     float interaction_radius = 2.0f;
-    float interaction_strength = 1200.0f;
-    float viscosity_strength = 0.5f;
+    float interaction_strength = 20.0f;
+    float viscosity_strength = 0.3f;
     bool gravity_enabled = true;
-    int num_particles = 800;
+    int num_particles = 2000;
+};
+
+struct Particle {
+    Vector2 position;
+    Vector2 predicted_position;
+    Vector2 velocity;
+    Vector2 force;
+    float density;
+    float near_density;
+    float pressure;
+    float padding;
+};
+
+struct ParticleIndex {
+    unsigned int cell_key;
+    unsigned int particle_id;
 };
 
 class FluidSimulation {
@@ -50,29 +66,27 @@ public:
     SimParams params;
 
 private:
-    std::vector<Vector2> position;
-    std::vector<Vector2> predicted_position;
-    std::vector<Vector2> velocity;
-    std::vector<Vector2> force;
-    std::vector<float> density;
-    std::vector<float> near_density;
-    std::vector<float> pressure;
+    unsigned int ssbo_indices;
+    unsigned int ssbo_offsets;
+    unsigned int ssbo_id;
+    ComputeShader offset_shader;
+    ComputeShader density_shader;
+    ComputeShader force_shader;
+    Shader particle_shader;
+    ComputeShader integrate_shader;
+    ComputeShader hash_shader;
+    Mesh quad_mesh;
+    Material quad_material;
+    std::vector<Matrix> dummy_transforms;
 
-    SpatialHash spatial_hash;
     KernelConstants kernel_constants;
     float cached_smoothing_radius = 0.0f;
 
     void apply_mouse_force();
     void update_kernel_constants();
 
-    void compute_density_pressure();
-    void compute_forces();
-    void compute_viscosity();
-    void integrate(float delta_time);
-
-    float poly6_kernel(float distance_squared);
-    float spiky_pow2_kernel(float distance);
-    float spiky_pow3_kernel(float distance);
-    float spiky_pow2_gradient(float distance);
-    float viscosity_kernel(float distance);
+    void update_integration(float delta_time);
+    void update_spatial_hash();
+    void update_density();
+    void update_forces();
 };

@@ -1,0 +1,90 @@
+#version 430
+
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct Particle {
+    vec2 position;
+    vec2 predicted_position;
+    vec2 velocity;
+    vec2 force;
+    float density;
+    float near_density;
+    float pressure;
+    float padding; // Alignment
+};
+
+struct ParticleIndex {
+    uint cell_key;
+    uint particle_id;
+};
+
+
+
+
+layout(std430, binding = 0) buffer ParticleBuffer {
+    Particle particles[];
+};
+
+layout(std430, binding = 1) buffer IndicesBuffer {
+    ParticleIndex indices[];
+};
+
+layout(std430, binding = 2) buffer OffsetsBuffer {
+    uint offsets[];
+};
+
+uniform uint num_particles;
+uniform float poly6_scale;
+uniform float spiky_pow3_scale;
+uniform float smoothing_radius_sq;
+uniform float spacing;
+
+uint hash(int x, int y) {
+    uint h = (uint(x) * 15823u) ^ (uint(y) * 9737333u);
+    return h % num_particles;
+}
+
+void main() {
+    uint id = gl_GlobalInvocationID.x;
+    if (id >= num_particles) return;
+
+    Particle p = particles[id];
+    p.density = 0.0;
+    p.near_density = 0.0;
+    
+    ivec2 grid_pos = ivec2(p.predicted_position / spacing);
+
+    for(int x = -1; x <= 1; x++){
+        for(int y = -1; y <= 1; y++){
+            ivec2 neighbor = grid_pos + ivec2(x, y);
+            uint cell_key = hash(neighbor.x, neighbor.y);
+            uint start_index = offsets[cell_key];
+            
+            if (start_index == 0xFFFFFFFFu) continue;
+            
+            for(uint i = start_index; i < num_particles; i++){
+                if(indices[i].cell_key != cell_key) break;
+                
+                Particle q = particles[indices[i].particle_id];
+                
+                vec2 r = q.predicted_position - p.predicted_position;
+                
+                float r2 = dot(r, r);
+                if(r2 < smoothing_radius_sq){
+                    float dist = sqrt(r2);
+                    float h = sqrt(smoothing_radius_sq);
+                    float h_minus_r = h - dist;
+                    
+                    float influence = poly6_scale * pow(smoothing_radius_sq - r2, 3); 
+                    p.density += influence;
+                    
+                    float influence_near = spiky_pow3_scale * h_minus_r * h_minus_r * h_minus_r;
+                    p.near_density += influence_near;
+                }
+            }
+        }
+    }
+    particles[id].density = p.density;
+    particles[id].near_density = p.near_density;
+}
+
