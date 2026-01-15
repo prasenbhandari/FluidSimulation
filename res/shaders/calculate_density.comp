@@ -38,6 +38,7 @@ uniform float poly6_scale;
 uniform float spiky_pow3_scale;
 uniform float smoothing_radius_sq;
 uniform float spacing;
+uniform float mass;
 
 uint hash(int x, int y) {
     uint h = (uint(x) * 15823u) ^ (uint(y) * 9737333u);
@@ -76,10 +77,10 @@ void main() {
                     float h_minus_r = h - dist;
                     
                     float influence = poly6_scale * pow(smoothing_radius_sq - r2, 3); 
-                    p.density += influence;
+                    p.density += influence * mass;
                     
                     float influence_near = spiky_pow3_scale * h_minus_r * h_minus_r * h_minus_r;
-                    p.near_density += influence_near;
+                    p.near_density += influence_near * mass;
                 }
             }
         }

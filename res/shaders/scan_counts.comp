@@ -1,0 +1,81 @@
+#version 430
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 2) buffer CountsBuffer {
+    uint counts[];
+};
+
+layout(std430, binding = 3) buffer BlockSums {
+    uint block_sums[];
+};
+
+uniform uint num_particles;
+
+shared uint temp[2048];
+
+void main(){
+    uint thread_id = gl_LocalInvocationID.x;
+    uint batch_id = gl_WorkGroupID.x;
+
+    uint offset = batch_id * 2048;
+
+    uint ai = thread_id;
+    uint bi = thread_id + 1024;
+
+    if(offset + ai < num_particles){
+        temp[ai] = counts[offset + ai];
+    }else{
+        temp[ai] = 0;
+    }
+
+    if(offset + bi < num_particles){
+        temp[bi] = counts[offset + bi];
+    }else{
+        temp[bi] = 0;
+    }
+
+    int stride = 1;
+    for(int d = 1024; d > 0; d >>= 1){
+        barrier();
+        if(thread_id < d){
+            int i = 2 * stride * int(thread_id);
+
+            int j = 2 * stride * int(thread_id) + stride;
+
+            int k = 2 * stride * int(thread_id) + 2 * stride - 1;
+
+            uint indexA = stride * (2 * thread_id + 1) - 1;
+            uint indexB = stride * (2 * thread_id + 2) - 1;
+
+            temp[indexB] += temp[indexA];
+        }
+        stride *= 2;
+    }
+
+    if (thread_id == 0){
+        block_sums[batch_id] = temp[2047];
+        temp[2047] = 0;
+    }
+
+    for(int d = 1; d <= 1024; d *= 2){
+        stride >>= 1;
+        barrier();
+        if(thread_id < d){
+            uint indexA = stride * (2 * thread_id + 1) - 1;
+            uint indexB = stride * (2 * thread_id + 2) - 1;
+            
+            uint t = temp[indexA];
+            temp[indexA] = temp[indexB];
+            temp[indexB] += t;
+        }
+    }
+    barrier();
+
+    if(offset + ai < num_particles){
+        counts[offset + ai] = temp[ai];
+    }
+    if(offset + bi < num_particles){
+        counts[offset + bi] = temp[bi];
+    }
+}
+

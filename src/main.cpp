@@ -1,7 +1,4 @@
 
-#include <iostream>
-
-#include "compute_shader.h"
 #include "raylib.h"
 #include "rlgl.h"
 #include "simulation.h"

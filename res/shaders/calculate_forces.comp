@@ -33,9 +33,10 @@ layout(std430, binding = 2) buffer OffsetsBuffer {
 uniform uint num_particles;
 uniform float spacing;
 uniform float smoothing_radius;
-uniform float interaction_strength;
+uniform float stiffness;
 uniform float near_pressure_multiplier;
 uniform float viscosity_strength;
+uniform float mass;
 
 uniform float spiky_pow2_grad_scale;
 uniform float spiky_pow3_grad_scale;
@@ -65,11 +66,11 @@ void main() {
 
     Particle p = particles[id];
     
-    vec2 force = vec2(0.0);
+    vec2 acceleration = vec2(0.0);
     
     float density = p.density;
     float near_density = p.near_density;
-    float pressure = interaction_strength * (density - rest_density);
+    float pressure = stiffness * (density - rest_density);
     float near_pressure = near_pressure_multiplier * near_density;
     
     ivec2 grid_pos = ivec2(p.predicted_position / spacing);
@@ -99,7 +100,7 @@ void main() {
                     vec2 dir = r / dist;
 
                     
-                    float n_pressure = interaction_strength * (n.density - rest_density);
+                    float n_pressure = stiffness * (n.density - rest_density);
                     float n_near_pressure = near_pressure_multiplier * n.near_density;
 
                     float shared_pressure = (pressure + n_pressure) / 2.0;          
@@ -108,17 +109,17 @@ void main() {
                     float p_term = spiky_gradient(dist, h_minus_r) * shared_pressure;
                     float near_term = near_gradient(dist, h_minus_r) * shared_near_pressure;
                     
-                    force -= dir * (p_term + near_term) / n.density;
+                    acceleration -= dir * (p_term + near_term) * mass / n.density;
 
                     vec2 vel_diff = n.velocity - p.velocity;
                     float visc_term = viscosity_kernel(dist, h_minus_r) * viscosity_strength;
                     
-                    force += vel_diff * visc_term / n.density;
+                    acceleration += vel_diff * visc_term * mass / n.density;
                 }
             }
         }
     }
 
-    particles[id].force = force;
+    particles[id].force = acceleration * mass; // Force = Mass * Acceleration
     particles[id].pressure = pressure;
 }

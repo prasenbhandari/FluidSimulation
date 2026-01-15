@@ -3,6 +3,7 @@
 #include <rlgl.h>
 
 #include <algorithm>
+#include <iostream>
 
 #include "raymath.h"
 
@@ -22,9 +23,18 @@ FluidSimulation::~FluidSimulation() {}
 
 void FluidSimulation::init() {
     ssbo_id = rlLoadShaderBuffer(sizeof(Particle) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
-    rlBindShaderBuffer(ssbo_id, 0);
-
     ssbo_indices = rlLoadShaderBuffer(sizeof(ParticleIndex) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
+
+    // Binding 2: Counts (Histogram)
+    ssbo_counts = rlLoadShaderBuffer(sizeof(unsigned int) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
+
+    // Binding 3: Block Sums (Auxiliary for Scan)
+    // Size = num_particles / 2048 (rounded up)
+    int num_blocks = (params.num_particles + 2047) / 2048;
+    ssbo_block_sums = rlLoadShaderBuffer(sizeof(unsigned int) * num_blocks, nullptr, RL_DYNAMIC_COPY);
+
+    // Binding 4: Sorted Indices (Output of scatter)
+    ssbo_sorted_indices = rlLoadShaderBuffer(sizeof(ParticleIndex) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
 
     ssbo_offsets = rlLoadShaderBuffer(sizeof(unsigned int) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
 
@@ -41,6 +51,9 @@ void FluidSimulation::init() {
     offset_shader.load("../res/shaders/calculate_offset.comp");
     density_shader.load("../res/shaders/calculate_density.comp");
     force_shader.load("../res/shaders/calculate_forces.comp");
+    count_shader.load("../res/shaders/count_frequencies.comp");
+    scan_shader.load("../res/shaders/scan_counts.comp");
+    scatter_shader.load("../res/shaders/scatter.comp");
 }
 
 void FluidSimulation::reset() {
@@ -90,13 +103,17 @@ void FluidSimulation::update_integration(float delta_time) {
     int dt_loc = rlGetLocationUniform(program, "deltaTime");
     int grav_loc = rlGetLocationUniform(program, "gravity");
     int damp_loc = rlGetLocationUniform(program, "damping");
+    int mass_loc = rlGetLocationUniform(program, "mass");
     int windowSize_loc = rlGetLocationUniform(program, "windowSize");
 
     rlSetUniform(dt_loc, &delta_time, SHADER_UNIFORM_FLOAT, 1);
-    rlSetUniform(grav_loc, &params.gravity, SHADER_UNIFORM_FLOAT, 1);
+
+    float current_gravity = params.gravity_enabled ? params.gravity : 0.0f;
+    rlSetUniform(grav_loc, &current_gravity, SHADER_UNIFORM_FLOAT, 1);
 
     float damping_val = fabs(params.boundary_damping);
     rlSetUniform(damp_loc, &damping_val, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(mass_loc, &params.mass, SHADER_UNIFORM_FLOAT, 1);
 
     float size[2] = {(float)WINDOW_WIDTH, (float)WINDOW_HEIGHT};
     rlSetUniform(windowSize_loc, size, SHADER_UNIFORM_VEC2, 1);
@@ -126,13 +143,64 @@ void FluidSimulation::update_spatial_hash() {
 
     hash_shader.dispatch(num_groups, 1, 1);
 
-    std::vector<ParticleIndex> cpu_indices(params.num_particles);
-    rlReadShaderBuffer(ssbo_indices, cpu_indices.data(), cpu_indices.size() * sizeof(ParticleIndex), 0);
+    rlDisableShader();  // Disable hash shader
 
-    std::sort(cpu_indices.begin(), cpu_indices.end(),
-              [](const ParticleIndex& a, const ParticleIndex& b) { return a.cell_key < b.cell_key; });
+    // DEBUG: Check Hash output
+    static int hash_debug_frame = 0;
+    if (hash_debug_frame++ == 0) {
+        std::vector<ParticleIndex> debug_indices(params.num_particles);
+        rlReadShaderBuffer(ssbo_indices, debug_indices.data(), debug_indices.size() * sizeof(ParticleIndex), 0);
+        std::cout << "DEBUG: Pre-Sort Keys: ";
+        for (int i = 0; i < std::min((int)params.num_particles, 20); ++i) std::cout << debug_indices[i].cell_key << " ";
+        std::cout << std::endl;
+    }
+    std::vector<unsigned int> zero_counts(params.num_particles, 0);
+    rlUpdateShaderBuffer(ssbo_counts, zero_counts.data(), zero_counts.size() * sizeof(unsigned int), 0);
 
-    rlUpdateShaderBuffer(ssbo_indices, cpu_indices.data(), cpu_indices.size() * sizeof(ParticleIndex), 0);
+    unsigned int count_prog = count_shader.get_program_id();
+    rlEnableShader(count_prog);
+    rlSetUniform(rlGetLocationUniform(count_prog, "num_particles"), &num_particles_uint, SHADER_UNIFORM_UINT, 1);
+    rlBindShaderBuffer(ssbo_indices, 1);
+    rlBindShaderBuffer(ssbo_counts, 2);
+
+    int count_groups = (params.num_particles + 255) / 256;
+    count_shader.dispatch(count_groups, 1, 1);
+    rlDisableShader();
+
+    unsigned int scan_prog = scan_shader.get_program_id();
+    rlEnableShader(scan_prog);
+    rlSetUniform(rlGetLocationUniform(scan_prog, "num_particles"), &num_particles_uint, SHADER_UNIFORM_UINT, 1);
+    rlBindShaderBuffer(ssbo_counts, 2);
+    rlBindShaderBuffer(ssbo_block_sums, 3);
+
+    int scan_groups = (params.num_particles + 2047) / 2048;
+    scan_shader.dispatch(scan_groups, 1, 1);
+    rlDisableShader();
+
+    unsigned int scatter_prog = scatter_shader.get_program_id();
+    rlEnableShader(scatter_prog);
+    rlSetUniform(rlGetLocationUniform(scatter_prog, "num_particles"), &num_particles_uint, SHADER_UNIFORM_UINT, 1);
+    rlBindShaderBuffer(ssbo_indices, 1);
+    rlBindShaderBuffer(ssbo_counts, 2);
+    rlBindShaderBuffer(ssbo_sorted_indices, 4);
+
+    int scatter_groups = (params.num_particles + 255) / 256;
+    scatter_shader.dispatch(scatter_groups, 1, 1);
+    rlDisableShader();
+
+    std::vector<ParticleIndex> sorted_cpu(params.num_particles);
+    rlReadShaderBuffer(ssbo_sorted_indices, sorted_cpu.data(), sorted_cpu.size() * sizeof(ParticleIndex), 0);
+    rlUpdateShaderBuffer(ssbo_indices, sorted_cpu.data(), sorted_cpu.size() * sizeof(ParticleIndex), 0);
+
+    // DEBUG: Print first 10 keys
+    static int debug_frame = 0;
+    if (debug_frame++ == 0) {
+        std::cout << "DEBUG: Sorted Keys sample: ";
+        for (int i = 0; i < std::min((int)params.num_particles, 20); ++i) {
+            std::cout << sorted_cpu[i].cell_key << " ";
+        }
+        std::cout << std::endl;
+    }
 
     std::vector<unsigned int> clear_offsets(params.num_particles, -1);
     rlUpdateShaderBuffer(ssbo_offsets, clear_offsets.data(), clear_offsets.size() * sizeof(unsigned int), 0);
@@ -162,6 +230,7 @@ void FluidSimulation::update_density() {
     int spiky_loc = rlGetLocationUniform(density_program, "spiky_pow3_scale");
     int smooth_loc = rlGetLocationUniform(density_program, "smoothing_radius_sq");
     int spacing_loc = rlGetLocationUniform(density_program, "spacing");
+    int mass_loc = rlGetLocationUniform(density_program, "mass");
 
     unsigned int num_particles_uint = (unsigned int)params.num_particles;
     rlSetUniform(num_loc, &num_particles_uint, SHADER_UNIFORM_UINT, 1);
@@ -169,6 +238,7 @@ void FluidSimulation::update_density() {
     rlSetUniform(spiky_loc, &kernel_constants.spiky_pow3_scale, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(smooth_loc, &kernel_constants.smoothing_radius_sq, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(spacing_loc, &params.smoothing_radius, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(mass_loc, &params.mass, SHADER_UNIFORM_FLOAT, 1);
 
     rlBindShaderBuffer(ssbo_id, 0);
     rlBindShaderBuffer(ssbo_indices, 1);
@@ -188,9 +258,10 @@ void FluidSimulation::update_forces() {
     int num_loc = rlGetLocationUniform(force_program, "num_particles");
     int spacing_loc = rlGetLocationUniform(force_program, "spacing");
     int smooth_loc = rlGetLocationUniform(force_program, "smoothing_radius");
-    int interact_loc = rlGetLocationUniform(force_program, "interaction_strength");
+    int stiffness_loc = rlGetLocationUniform(force_program, "stiffness");
     int near_pres_loc = rlGetLocationUniform(force_program, "near_pressure_multiplier");
     int visc_str_loc = rlGetLocationUniform(force_program, "viscosity_strength");
+    int mass_loc = rlGetLocationUniform(force_program, "mass");
 
     int spiky_grad_loc = rlGetLocationUniform(force_program, "spiky_pow2_grad_scale");
     int near_grad_loc = rlGetLocationUniform(force_program, "spiky_pow3_grad_scale");
@@ -201,9 +272,10 @@ void FluidSimulation::update_forces() {
     rlSetUniform(num_loc, &num_particles_uint, SHADER_UNIFORM_UINT, 1);
     rlSetUniform(spacing_loc, &params.smoothing_radius, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(smooth_loc, &params.smoothing_radius, SHADER_UNIFORM_FLOAT, 1);
-    rlSetUniform(interact_loc, &params.interaction_strength, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(stiffness_loc, &params.stiffness, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(near_pres_loc, &params.near_pressure_multiplier, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(visc_str_loc, &params.viscosity_strength, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(mass_loc, &params.mass, SHADER_UNIFORM_FLOAT, 1);
 
     rlSetUniform(spiky_grad_loc, &kernel_constants.spiky_pow2_grad_scale, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(near_grad_loc, &kernel_constants.spiky_pow3_grad_scale, SHADER_UNIFORM_FLOAT, 1);
@@ -356,13 +428,13 @@ void FluidSimulation::draw_gui() {
               &params.near_pressure_multiplier, 0.0f, 10.0f);
     y += spacing;
 
-    // Boundary Damping
-    GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20},
-             TextFormat("Boundary Damping: %.2f", params.boundary_damping));
-    y += 18;
-    GuiSlider((Rectangle){(float)panel_x, (float)y, (float)panel_width - 10, (float)slider_height}, "", "",
-              &params.boundary_damping, -1.0f, 0.0f);
-    y += spacing + 10;
+    // // Boundary Damping
+    // GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20},
+    //          TextFormat("Boundary Damping: %.2f", params.boundary_damping));
+    // y += 18;
+    // GuiSlider((Rectangle){(float)panel_x, (float)y, (float)panel_width - 10, (float)slider_height}, "", "",
+    //           &params.boundary_damping, -1.0f, 0.0f);
+    // y += spacing + 10;
 
     // Reset button
     if (GuiButton((Rectangle){(float)panel_x, (float)y, (float)panel_width - 10, 30}, "RESET SIMULATION")) {

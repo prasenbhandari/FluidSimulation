@@ -25,7 +25,7 @@ out float fragDensity;
 
 void main() {
     Particle p = particles[gl_InstanceID];
-    float particleSize = 0.3;
+    float particleSize = 0.2;
 
     vec2 scaledVertex = vertexPosition.xz * particleSize;
 

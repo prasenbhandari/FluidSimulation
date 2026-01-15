@@ -25,14 +25,14 @@ struct SimParams {
     float rest_density = 5.0f;
     float stiffness = 50.0f;
     float near_pressure_multiplier = 1.0f;
-    float smoothing_radius = 0.5f;
+    float smoothing_radius = 1.2f;
     float damping = 0.97f;
     float boundary_damping = 0.95f;
     float interaction_radius = 2.0f;
     float interaction_strength = 20.0f;
     float viscosity_strength = 0.3f;
     bool gravity_enabled = true;
-    int num_particles = 2000;
+    int num_particles = 1000;
 };
 
 struct Particle {
@@ -67,11 +67,17 @@ public:
 
 private:
     unsigned int ssbo_indices;
+    unsigned int ssbo_counts;          // Binding 2
+    unsigned int ssbo_block_sums;      // Binding 3
+    unsigned int ssbo_sorted_indices;  // Binding 4
     unsigned int ssbo_offsets;
     unsigned int ssbo_id;
     ComputeShader offset_shader;
     ComputeShader density_shader;
     ComputeShader force_shader;
+    ComputeShader count_shader;
+    ComputeShader scan_shader;
+    ComputeShader scatter_shader;
     Shader particle_shader;
     ComputeShader integrate_shader;
     ComputeShader hash_shader;

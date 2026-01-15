@@ -5,6 +5,7 @@ layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 uniform float deltaTime;
 uniform float gravity;
 uniform float damping;
+uniform float mass;
 uniform vec2 windowSize;
 
 struct Particle {
@@ -29,7 +30,9 @@ void main() {
 
     Particle p = particles[id];
 
-    vec2 force_contribution = p.force * deltaTime;
+    // F = ma -> a = F/m
+    vec2 acceleration = p.force / mass;
+    vec2 force_contribution = acceleration * deltaTime;
     
     float force_mag = length(force_contribution);
     const float MAX_FORCE_CONTRIBUTION = 5.0;
@@ -38,7 +41,7 @@ void main() {
     }
     
     p.velocity += force_contribution;
-    p.velocity.y += gravity * deltaTime;
+    p.velocity.y += gravity * deltaTime; // Gravity is already acceleration (g)
     p.force = vec2(0.0);
     
     p.velocity *= 0.99;
