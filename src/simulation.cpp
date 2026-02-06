@@ -8,10 +8,11 @@
 #include "raymath.h"
 
 #define RAYGUI_IMPLEMENTATION
+#include "external/glad.h"
 #include "raygui.h"
 
-const int WINDOW_WIDTH = 800 / PIXELS_PER_METER;
-const int WINDOW_HEIGHT = 600 / PIXELS_PER_METER;
+const int WINDOW_WIDTH = WINDOW_WIDTH_PIXELS / PIXELS_PER_METER;
+const int WINDOW_HEIGHT = WINDOW_HEIGHT_PIXELS / PIXELS_PER_METER;
 
 FluidSimulation::FluidSimulation() {
     init();
@@ -26,9 +27,21 @@ void FluidSimulation::init() {
     ssbo_counts = rlLoadShaderBuffer(sizeof(unsigned int) * params.num_particles, nullptr, RL_DYNAMIC_DRAW);
 
     // Binding 3: Block Sums (Auxiliary for Scan)
-    // Size = num_particles / 2048 (rounded up)
-    int num_blocks = (params.num_particles + 2047) / 2048;
-    ssbo_block_sums = rlLoadShaderBuffer(sizeof(unsigned int) * num_blocks, nullptr, RL_DYNAMIC_DRAW);
+    scan_buffers.clear();
+    int n = params.num_particles;
+
+    while (n > 0) {
+        int num_blocks = (n + 2047) / 2048;
+        if (num_blocks == 0) break;
+
+        unsigned int buffer = rlLoadShaderBuffer(sizeof(unsigned int) * num_blocks, nullptr, RL_DYNAMIC_DRAW);
+        scan_buffers.push_back(buffer);
+
+        n = num_blocks;
+        if (n == 1) break;
+    }
+
+    if (!scan_buffers.empty()) ssbo_block_sums = scan_buffers[0];
 
     // Binding 4: Sorted Indices (Output of scatter)
     ssbo_sorted_indices = rlLoadShaderBuffer(sizeof(ParticleIndex) * params.num_particles, nullptr, RL_DYNAMIC_DRAW);
@@ -53,6 +66,7 @@ void FluidSimulation::init() {
     force_shader.load("../res/shaders/calculate_forces.comp");
     count_shader.load("../res/shaders/count_frequencies.comp");
     scan_shader.load("../res/shaders/scan_counts.comp");
+    scan_add_shader.load("../res/shaders/scan_add.comp");
     scatter_shader.load("../res/shaders/scatter.comp");
 }
 
@@ -95,10 +109,33 @@ void FluidSimulation::reset() {
 }
 
 void FluidSimulation::update(float delta_time) {
-    update_integration(delta_time);
-    update_spatial_hash();
-    update_density();
-    update_forces();
+    float dt = delta_time * params.time_scale / params.sub_steps;
+
+    for (int i = 0; i < params.sub_steps; i++) {
+        update_integration(dt);
+        update_spatial_hash();
+        update_density();
+        update_forces();
+    }
+
+    // Debug print every 60 frames
+    static int debug_frame_counter = 0;
+    if (debug_frame_counter++ >= 60) {
+        debug_frame_counter = 0;
+
+        std::vector<Particle> particles(params.num_particles);
+        rlReadShaderBuffer(ssbo_id, particles.data(), particles.size() * sizeof(Particle), 0);
+
+        // Print stats for a few particles
+        std::cout << "--- Simulation Stats ---" << std::endl;
+        for (int i = 0; i < std::min(5, params.num_particles); i++) {
+            std::cout << "P[" << i << "]: "
+                      << "Pos(" << particles[i].position.x << "," << particles[i].position.y << ") "
+                      << "Vel(" << particles[i].velocity.x << "," << particles[i].velocity.y << ") "
+                      << "Dens: " << particles[i].density << " "
+                      << "Pres: " << particles[i].pressure << std::endl;
+        }
+    }
 }
 
 void FluidSimulation::update_integration(float delta_time) {
@@ -151,8 +188,8 @@ void FluidSimulation::update_spatial_hash() {
     rlBindShaderBuffer(ssbo_indices, 1);
 
     hash_shader.dispatch(num_groups, 1, 1);
-
     rlDisableShader();  // Disable hash shader
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
 
     // DEBUG: Check Hash output
     static int hash_debug_frame = 0;
@@ -175,16 +212,9 @@ void FluidSimulation::update_spatial_hash() {
     int count_groups = (params.num_particles + 255) / 256;
     count_shader.dispatch(count_groups, 1, 1);
     rlDisableShader();
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
 
-    unsigned int scan_prog = scan_shader.get_program_id();
-    rlEnableShader(scan_prog);
-    rlSetUniform(rlGetLocationUniform(scan_prog, "num_particles"), &num_particles_uint, SHADER_UNIFORM_UINT, 1);
-    rlBindShaderBuffer(ssbo_counts, 2);
-    rlBindShaderBuffer(ssbo_block_sums, 3);
-
-    int scan_groups = (params.num_particles + 2047) / 2048;
-    scan_shader.dispatch(scan_groups, 1, 1);
-    rlDisableShader();
+    perform_scan(ssbo_counts, params.num_particles, 0);
 
     unsigned int scatter_prog = scatter_shader.get_program_id();
     rlEnableShader(scatter_prog);
@@ -196,6 +226,7 @@ void FluidSimulation::update_spatial_hash() {
     int scatter_groups = (params.num_particles + 255) / 256;
     scatter_shader.dispatch(scatter_groups, 1, 1);
     rlDisableShader();
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
 
     std::vector<ParticleIndex> sorted_cpu(params.num_particles);
     rlReadShaderBuffer(ssbo_sorted_indices, sorted_cpu.data(), sorted_cpu.size() * sizeof(ParticleIndex), 0);
@@ -226,6 +257,7 @@ void FluidSimulation::update_spatial_hash() {
     offset_shader.dispatch(num_groups, 1, 1);
 
     rlDisableShader();
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
 }
 
 void FluidSimulation::update_density() {
@@ -235,7 +267,7 @@ void FluidSimulation::update_density() {
     rlEnableShader(density_program);
 
     int num_loc = rlGetLocationUniform(density_program, "num_particles");
-    int poly6_loc = rlGetLocationUniform(density_program, "poly6_scale");
+    int density_scale_loc = rlGetLocationUniform(density_program, "spiky_pow2_scale");
     int spiky_loc = rlGetLocationUniform(density_program, "spiky_pow3_scale");
     int smooth_loc = rlGetLocationUniform(density_program, "smoothing_radius_sq");
     int spacing_loc = rlGetLocationUniform(density_program, "spacing");
@@ -243,7 +275,7 @@ void FluidSimulation::update_density() {
 
     unsigned int num_particles_uint = (unsigned int)params.num_particles;
     rlSetUniform(num_loc, &num_particles_uint, SHADER_UNIFORM_UINT, 1);
-    rlSetUniform(poly6_loc, &kernel_constants.poly6_scale, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(density_scale_loc, &kernel_constants.spiky_pow2_scale, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(spiky_loc, &kernel_constants.spiky_pow3_scale, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(smooth_loc, &kernel_constants.smoothing_radius_sq, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(spacing_loc, &params.smoothing_radius, SHADER_UNIFORM_FLOAT, 1);
@@ -330,6 +362,9 @@ void FluidSimulation::update_kernel_constants() {
     // Poly6: 4 / (PI * h^8)
     kernel_constants.poly6_scale = 4.0f / (PI * h8);
 
+    // Spiky Pow2 (Density): 6 / (PI * h^4)
+    kernel_constants.spiky_pow2_scale = 6.0f / (PI * h4);
+
     // Spiky Pow3 (Near Density): 10 / (PI * h^5)
     kernel_constants.spiky_pow3_scale = 10.0f / (PI * h5);
 
@@ -339,14 +374,14 @@ void FluidSimulation::update_kernel_constants() {
     // Spiky Pow3 Gradient (Near Pressure): 30 / (PI * h^5)
     kernel_constants.spiky_pow3_grad_scale = 30.0f / (PI * h5);
 
-    // Viscosity: 40 / (PI * h^5)
-    kernel_constants.viscosity_scale = 40.0f / (PI * h5);
+    // Viscosity (Poly6): 4 / (PI * h^8)
+    kernel_constants.viscosity_scale = 4.0f / (PI * h8);
 }
 
 void FluidSimulation::draw_gui() {
     // GUI Panel
     int panel_width = 210;
-    int panel_x = 800 - panel_width - 10;
+    int panel_x = WINDOW_WIDTH_PIXELS - panel_width - 10;
     int panel_y = 10;
     int slider_height = 20;
     int spacing = 30;
@@ -355,6 +390,25 @@ void FluidSimulation::draw_gui() {
     DrawRectangle(panel_x - 5, panel_y - 5, panel_width + 10, 480, Fade(DARKGRAY, 0.8f));
 
     GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20}, "=== FLUID CONTROLS ===");
+    y += spacing;
+
+    // Time Scale
+    GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20},
+             TextFormat("Time Scale: %.2f", params.time_scale));
+    y += 18;
+    GuiSlider((Rectangle){(float)panel_x, (float)y, (float)panel_width - 10, (float)slider_height}, "", "",
+              &params.time_scale, 0.0f, 2.0f);
+    y += spacing;
+
+    // Sub Steps
+    GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20},
+             TextFormat("Sub Steps: %d", params.sub_steps));
+    y += 18;
+    float sub_steps_float = (float)params.sub_steps;
+    if (GuiSlider((Rectangle){(float)panel_x, (float)y, (float)panel_width - 10, (float)slider_height}, "", "",
+                  &sub_steps_float, 1.0f, 20.0f)) {
+        params.sub_steps = (int)sub_steps_float;
+    }
     y += spacing;
 
     // Gravity toggle
@@ -456,4 +510,40 @@ void FluidSimulation::draw_gui() {
              TextFormat("Particles: %d", params.num_particles));
     y += 20;
     GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20}, "LMB: Push  RMB: Pull");
+}
+
+void FluidSimulation::perform_scan(unsigned int data_buffer, int n, int depth) {
+    if (depth >= scan_buffers.size()) {
+        if (n > 2048) {
+            std::cerr << "Error: Not enough scan buffers for depth " << depth << " with n=" << n << std::endl;
+        }
+        return;
+    }
+
+    int num_groups = (n + 2047) / 2048;
+    unsigned int block_sum_buffer = scan_buffers[depth];
+
+    unsigned int scan_prog = scan_shader.get_program_id();
+    rlEnableShader(scan_prog);
+    rlSetUniform(rlGetLocationUniform(scan_prog, "num_particles"), &n, SHADER_UNIFORM_UINT, 1);
+    rlBindShaderBuffer(data_buffer, 2);
+    rlBindShaderBuffer(block_sum_buffer, 3);
+    rlBindShaderBuffer(block_sum_buffer, 3);
+    scan_shader.dispatch(num_groups, 1, 1);
+    rlDisableShader();
+    glMemoryBarrier(GL_ALL_BARRIER_BITS);
+
+    if (num_groups > 1) {
+        perform_scan(block_sum_buffer, num_groups, depth + 1);
+
+        unsigned int add_prog = scan_add_shader.get_program_id();
+        rlEnableShader(add_prog);
+        unsigned int n_uint = (unsigned int)n;
+        rlSetUniform(rlGetLocationUniform(add_prog, "n"), &n_uint, SHADER_UNIFORM_UINT, 1);
+        rlBindShaderBuffer(data_buffer, 2);
+        rlBindShaderBuffer(block_sum_buffer, 3);
+        scan_add_shader.dispatch(num_groups, 1, 1);
+        rlDisableShader();
+        glMemoryBarrier(GL_ALL_BARRIER_BITS);
+    }
 }

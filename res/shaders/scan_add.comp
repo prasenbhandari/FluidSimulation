@@ -1,0 +1,32 @@
+#version 430
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 2) buffer DataBuffer {
+    uint data[];
+};
+
+layout(std430, binding = 3) buffer BlockSumBuffer {
+    uint block_sums[];
+};
+
+uniform uint n;
+
+void main() {
+    uint thread_id = gl_LocalInvocationID.x;
+    uint group_id = gl_WorkGroupID.x;
+    uint offset = group_id * 2048;
+
+    if (group_id == 0) return;
+
+    uint sum_val = block_sums[group_id];
+
+    uint ai = offset + thread_id;
+    uint bi = offset + thread_id + 1024;
+
+    if (ai < n) {
+        data[ai] += sum_val;
+    }
+    if (bi < n) {
+        data[bi] += sum_val;
+    }
+}

@@ -54,8 +54,9 @@ void main() {
         p.velocity = normalize(p.velocity) * MAX_VELOCITY;
     }
 
-    p.position += p.velocity * deltaTime;
     p.predicted_position = p.position + p.velocity * deltaTime;
+
+    p.position += p.velocity * deltaTime;
 
     float radius = 0.15;
     

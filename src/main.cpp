@@ -3,8 +3,8 @@
 #include "rlgl.h"
 #include "simulation.h"
 
-const int WINDOW_WIDTH = 800;
-const int WINDOW_HEIGHT = 600;
+const int WINDOW_WIDTH = WINDOW_WIDTH_PIXELS;
+const int WINDOW_HEIGHT = WINDOW_HEIGHT_PIXELS;
 
 int main() {
     SetConfigFlags(FLAG_VSYNC_HINT);

@@ -6,6 +6,8 @@
 #include "raylib.h"
 
 const float PIXELS_PER_METER = 50.0f;
+const int WINDOW_WIDTH_PIXELS = 1600;
+const int WINDOW_HEIGHT_PIXELS = 900;
 
 // Precomputed kernel constants
 struct KernelConstants {
@@ -31,8 +33,10 @@ struct SimParams {
     float interaction_radius = 2.0f;
     float interaction_strength = 20.0f;
     float viscosity_strength = 0.3f;
-    bool gravity_enabled = true;
-    int num_particles = 2000;
+    bool gravity_enabled = false;
+    int sub_steps = 3;
+    float time_scale = 1.0f;
+    int num_particles = 4096;
 };
 
 struct Particle {
@@ -77,6 +81,7 @@ private:
     ComputeShader force_shader;
     ComputeShader count_shader;
     ComputeShader scan_shader;
+    ComputeShader scan_add_shader;
     ComputeShader scatter_shader;
     Shader particle_shader;
     ComputeShader integrate_shader;
@@ -95,4 +100,7 @@ private:
     void update_spatial_hash();
     void update_density();
     void update_forces();
+
+    void perform_scan(unsigned int data_buffer, int n, int depth);
+    std::vector<unsigned int> scan_buffers;
 };

@@ -56,8 +56,10 @@ float near_gradient(float dist, float h_minus_r) {
     return spiky_pow3_grad_scale * h_minus_r * h_minus_r * h_minus_r;
 }
 
-float viscosity_kernel(float dist, float h_minus_r) {
-    return viscosity_scale * h_minus_r * h_minus_r;
+float viscosity_kernel(float dist, float r2) {
+    float h2 = smoothing_radius * smoothing_radius;
+    float v = h2 - r2;
+    return viscosity_scale * v * v * v;
 }
 
 void main() {
@@ -112,7 +114,7 @@ void main() {
                     acceleration -= dir * (p_term + near_term) * mass / n.density;
 
                     vec2 vel_diff = n.velocity - p.velocity;
-                    float visc_term = viscosity_kernel(dist, h_minus_r) * viscosity_strength;
+                    float visc_term = viscosity_kernel(dist, r2) * viscosity_strength;
                     
                     acceleration += vel_diff * visc_term * mass / n.density;
                 }
