@@ -32,7 +32,7 @@ struct SimParams {
     float interaction_strength = 20.0f;
     float viscosity_strength = 0.3f;
     bool gravity_enabled = true;
-    int num_particles = 1000;
+    int num_particles = 2000;
 };
 
 struct Particle {

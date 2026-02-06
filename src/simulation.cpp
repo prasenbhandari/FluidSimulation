@@ -22,21 +22,18 @@ FluidSimulation::FluidSimulation() {
 FluidSimulation::~FluidSimulation() {}
 
 void FluidSimulation::init() {
-    ssbo_id = rlLoadShaderBuffer(sizeof(Particle) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
-    ssbo_indices = rlLoadShaderBuffer(sizeof(ParticleIndex) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
-
     // Binding 2: Counts (Histogram)
-    ssbo_counts = rlLoadShaderBuffer(sizeof(unsigned int) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
+    ssbo_counts = rlLoadShaderBuffer(sizeof(unsigned int) * params.num_particles, nullptr, RL_DYNAMIC_DRAW);
 
     // Binding 3: Block Sums (Auxiliary for Scan)
     // Size = num_particles / 2048 (rounded up)
     int num_blocks = (params.num_particles + 2047) / 2048;
-    ssbo_block_sums = rlLoadShaderBuffer(sizeof(unsigned int) * num_blocks, nullptr, RL_DYNAMIC_COPY);
+    ssbo_block_sums = rlLoadShaderBuffer(sizeof(unsigned int) * num_blocks, nullptr, RL_DYNAMIC_DRAW);
 
     // Binding 4: Sorted Indices (Output of scatter)
-    ssbo_sorted_indices = rlLoadShaderBuffer(sizeof(ParticleIndex) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
+    ssbo_sorted_indices = rlLoadShaderBuffer(sizeof(ParticleIndex) * params.num_particles, nullptr, RL_DYNAMIC_DRAW);
 
-    ssbo_offsets = rlLoadShaderBuffer(sizeof(unsigned int) * params.num_particles, nullptr, RL_DYNAMIC_COPY);
+    ssbo_offsets = rlLoadShaderBuffer(sizeof(unsigned int) * params.num_particles, nullptr, RL_DYNAMIC_DRAW);
 
     particle_shader = LoadShader("../res/shaders/particle.vs", "../res/shaders/particle.fs");
     particle_shader.locs[SHADER_LOC_MATRIX_MVP] = GetShaderLocation(particle_shader, "mvp");
@@ -46,6 +43,9 @@ void FluidSimulation::init() {
     quad_mesh = GenMeshPlane(1.0f, 1.0f, 1, 1);
     quad_material = LoadMaterialDefault();
     quad_material.shader = particle_shader;
+
+    ssbo_id = 0;
+    ssbo_indices = 0;
 
     integrate_shader.load("../res/shaders/integrate.comp");
     offset_shader.load("../res/shaders/calculate_offset.comp");
@@ -85,7 +85,12 @@ void FluidSimulation::reset() {
         particles[i].pressure = 0;
     }
 
-    rlUpdateShaderBuffer(ssbo_id, particles.data(), sizeof(Particle) * params.num_particles, 0);
+    if (ssbo_id != 0) rlUnloadShaderBuffer(ssbo_id);
+    ssbo_id = rlLoadShaderBuffer(sizeof(Particle) * params.num_particles, particles.data(), RL_DYNAMIC_DRAW);
+
+    if (ssbo_indices != 0) rlUnloadShaderBuffer(ssbo_indices);
+    ssbo_indices = rlLoadShaderBuffer(sizeof(ParticleIndex) * params.num_particles, nullptr, RL_DYNAMIC_DRAW);
+
     update_kernel_constants();
 }
 
@@ -105,6 +110,7 @@ void FluidSimulation::update_integration(float delta_time) {
     int damp_loc = rlGetLocationUniform(program, "damping");
     int mass_loc = rlGetLocationUniform(program, "mass");
     int windowSize_loc = rlGetLocationUniform(program, "windowSize");
+    int num_parts_loc = rlGetLocationUniform(program, "num_particles");
 
     rlSetUniform(dt_loc, &delta_time, SHADER_UNIFORM_FLOAT, 1);
 
@@ -117,6 +123,9 @@ void FluidSimulation::update_integration(float delta_time) {
 
     float size[2] = {(float)WINDOW_WIDTH, (float)WINDOW_HEIGHT};
     rlSetUniform(windowSize_loc, size, SHADER_UNIFORM_VEC2, 1);
+
+    unsigned int num_p = (unsigned int)params.num_particles;
+    rlSetUniform(num_parts_loc, &num_p, SHADER_UNIFORM_UINT, 1);
 
     rlBindShaderBuffer(ssbo_id, 0);
 

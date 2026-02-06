@@ -8,6 +8,8 @@ uniform float damping;
 uniform float mass;
 uniform vec2 windowSize;
 
+uniform uint num_particles; // Added uniform
+
 struct Particle {
     vec2 position;
     vec2 predicted_position;
@@ -26,7 +28,7 @@ layout(std430, binding = 0) buffer ParticleBuffer {
 void main() {
     uint id = gl_GlobalInvocationID.x;
 
-    if (id >= particles.length()) return;
+    if (id >= num_particles) return; // Use uniform instead of .length()
 
     Particle p = particles[id];
 
