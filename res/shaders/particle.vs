@@ -21,7 +21,7 @@ layout(std430, binding = 0) buffer ParticleBuffer {
 };
 
 out vec2 fragTexCoord;
-out float fragDensity;
+out float fragSpeed;
 
 void main() {
     Particle p = particles[gl_InstanceID];
@@ -34,5 +34,6 @@ void main() {
     gl_Position = mvp * vec4(worldPosition, 0.0, 1.0);
 
     fragTexCoord = vertexTexCoord;
-    fragDensity = p.density;
+    float speed = length(p.velocity);
+    fragSpeed = speed;
 }

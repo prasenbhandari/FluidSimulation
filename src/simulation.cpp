@@ -323,6 +323,25 @@ void FluidSimulation::update_forces() {
     rlSetUniform(visc_loc, &kernel_constants.viscosity_scale, SHADER_UNIFORM_FLOAT, 1);
     rlSetUniform(rest_density_loc, &params.rest_density, SHADER_UNIFORM_FLOAT, 1);
 
+    Vector2 mouse_pos = GetMousePosition();
+    Vector2 sim_mouse_pos = {mouse_pos.x / PIXELS_PER_METER, mouse_pos.y / PIXELS_PER_METER};
+    int mouse_pressed = 0;
+    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT))
+        mouse_pressed = 1;
+    else if (IsMouseButtonDown(MOUSE_BUTTON_RIGHT))
+        mouse_pressed = 2;
+
+    int mouse_pos_loc = rlGetLocationUniform(force_program, "mouse_pos");
+    int mouse_pressed_loc = rlGetLocationUniform(force_program, "mouse_pressed");
+    int interact_rad_loc = rlGetLocationUniform(force_program, "interaction_radius");
+    int interact_str_loc = rlGetLocationUniform(force_program, "interaction_strength");
+
+    float mouse_pos_array[2] = {sim_mouse_pos.x, sim_mouse_pos.y};
+    rlSetUniform(mouse_pos_loc, mouse_pos_array, SHADER_UNIFORM_VEC2, 1);
+    rlSetUniform(mouse_pressed_loc, &mouse_pressed, SHADER_UNIFORM_INT, 1);
+    rlSetUniform(interact_rad_loc, &params.interaction_radius, SHADER_UNIFORM_FLOAT, 1);
+    rlSetUniform(interact_str_loc, &params.interaction_strength, SHADER_UNIFORM_FLOAT, 1);
+
     rlBindShaderBuffer(ssbo_id, 0);       // Particles (RW)
     rlBindShaderBuffer(ssbo_indices, 1);  // Indices (Read)
     rlBindShaderBuffer(ssbo_offsets, 2);  // Offsets (Read)
@@ -379,6 +398,8 @@ void FluidSimulation::update_kernel_constants() {
 }
 
 void FluidSimulation::draw_gui() {
+    GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(WHITE));
+
     // GUI Panel
     int panel_width = 210;
     int panel_x = WINDOW_WIDTH_PIXELS - panel_width - 10;
@@ -387,7 +408,7 @@ void FluidSimulation::draw_gui() {
     int spacing = 30;
     int y = panel_y;
 
-    DrawRectangle(panel_x - 5, panel_y - 5, panel_width + 10, 480, Fade(DARKGRAY, 0.8f));
+    DrawRectangle(panel_x - 5, panel_y - 5, panel_width + 10, 680, Fade(DARKGRAY, 0.8f));
 
     GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20}, "=== FLUID CONTROLS ===");
     y += spacing;
@@ -490,14 +511,6 @@ void FluidSimulation::draw_gui() {
     GuiSlider((Rectangle){(float)panel_x, (float)y, (float)panel_width - 10, (float)slider_height}, "", "",
               &params.near_pressure_multiplier, 0.0f, 10.0f);
     y += spacing;
-
-    // // Boundary Damping
-    // GuiLabel((Rectangle){(float)panel_x, (float)y, (float)panel_width, 20},
-    //          TextFormat("Boundary Damping: %.2f", params.boundary_damping));
-    // y += 18;
-    // GuiSlider((Rectangle){(float)panel_x, (float)y, (float)panel_width - 10, (float)slider_height}, "", "",
-    //           &params.boundary_damping, -1.0f, 0.0f);
-    // y += spacing + 10;
 
     // Reset button
     if (GuiButton((Rectangle){(float)panel_x, (float)y, (float)panel_width - 10, 30}, "RESET SIMULATION")) {

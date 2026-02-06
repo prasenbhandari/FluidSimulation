@@ -27,10 +27,10 @@ struct SimParams {
     float rest_density = 5.0f;
     float stiffness = 50.0f;
     float near_pressure_multiplier = 1.0f;
-    float smoothing_radius = 1.2f;
+    float smoothing_radius = 0.5f;
     float damping = 0.97f;
     float boundary_damping = 0.95f;
-    float interaction_radius = 2.0f;
+    float interaction_radius = 3.0f;
     float interaction_strength = 20.0f;
     float viscosity_strength = 0.3f;
     bool gravity_enabled = false;
@@ -93,7 +93,6 @@ private:
     KernelConstants kernel_constants;
     float cached_smoothing_radius = 0.0f;
 
-    void apply_mouse_force();
     void update_kernel_constants();
 
     void update_integration(float delta_time);

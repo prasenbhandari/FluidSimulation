@@ -43,6 +43,11 @@ uniform float spiky_pow3_grad_scale;
 uniform float viscosity_scale;
 uniform float rest_density;
 
+uniform vec2 mouse_pos;
+uniform int mouse_pressed; // 0: None, 1: Left (Push), 2: Right (Pull)
+uniform float interaction_radius;
+uniform float interaction_strength;
+
 uint hash(int x, int y) {
     uint h = (uint(x) * 15823u) ^ (uint(y) * 9737333u);
     return h % num_particles;
@@ -123,5 +128,23 @@ void main() {
     }
 
     particles[id].force = acceleration * mass; // Force = Mass * Acceleration
+    
+    // Mouse Interaction
+    if (mouse_pressed != 0) {
+        vec2 dir = p.position - mouse_pos;
+        float dist = length(dir);
+        
+        if (dist < interaction_radius) {
+            float strength = interaction_strength * (1.0 - dist / interaction_radius);
+            
+            if (mouse_pressed == 1) { // Left Click: Push
+                particles[id].force += normalize(dir) * strength * 5.0; // Push away
+            }
+            else if (mouse_pressed == 2) { // Right Click: Pull
+                particles[id].force -= normalize(dir) * strength * 5.0; // Pull towards
+            }
+        }
+    }
+
     particles[id].pressure = pressure;
 }
